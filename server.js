@@ -1,24 +1,54 @@
 const express = require("express");
-const http = require("http");
-const cors = require("cors");
-const { Server } = require("socket.io");
+const crypto = require("crypto");
+const path = require("path");
 
 const app = express();
-const server = http.createServer(app);
+const PORT = process.env.PORT || 3000;
 
-app.use(cors());
-app.use(express.json());
-
-const io = new Server(server, {
-    cors: {
-        origin: "*",
-        methods: ["GET", "POST"]
-    }
-});
-
-const PORT = process.env.PORT || 10000;
+app.use(express.urlencoded({ extended: true }));
+app.use(express.static(path.join(__dirname, "public")));
 
 const rooms = new Map();
+
+/* =========================================================
+   HELPERS
+========================================================= */
+
+function makeId(length = 12) {
+    return crypto.randomBytes(length).toString("hex");
+}
+
+function makeRoomCode() {
+    let code;
+
+    do {
+        code = crypto
+            .randomBytes(4)
+            .toString("hex")
+            .toUpperCase();
+    } while (rooms.has(code));
+
+    return code;
+}
+
+function escapeHtml(value) {
+    return String(value)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+}
+
+function redirect(res, roomCode, playerId) {
+    res.redirect(
+        `/game?room=${encodeURIComponent(roomCode)}&player=${encodeURIComponent(playerId)}`
+    );
+}
+
+/* =========================================================
+   DECK
+========================================================= */
 
 const COLORS = ["red", "yellow", "green", "blue"];
 
@@ -26,446 +56,1545 @@ function createDeck() {
     const deck = [];
 
     for (const color of COLORS) {
-        deck.push({ color, value: "0" });
 
-        for (let i = 1; i <= 9; i++) {
-            deck.push({ color, value: String(i) });
-            deck.push({ color, value: String(i) });
+        // One zero
+        deck.push({
+            color,
+            type: "number",
+            value: 0
+        });
+
+        // Two of 1–9
+        for (let value = 1; value <= 9; value++) {
+            deck.push({
+                color,
+                type: "number",
+                value
+            });
+
+            deck.push({
+                color,
+                type: "number",
+                value
+            });
         }
 
+        // Action cards
         for (let i = 0; i < 2; i++) {
-            deck.push({ color, value: "skip" });
-            deck.push({ color, value: "reverse" });
-            deck.push({ color, value: "draw2" });
+            deck.push({
+                color,
+                type: "skip"
+            });
+
+            deck.push({
+                color,
+                type: "reverse"
+            });
+
+            deck.push({
+                color,
+                type: "draw2"
+            });
         }
     }
 
+    // Wilds
     for (let i = 0; i < 4; i++) {
-        deck.push({ color: "wild", value: "wild" });
-        deck.push({ color: "wild", value: "draw4" });
+        deck.push({
+            color: null,
+            type: "wild"
+        });
+
+        deck.push({
+            color: null,
+            type: "wild4"
+        });
     }
 
-    return shuffle(deck);
+    return deck;
 }
 
-function shuffle(array) {
-    const copy = [...array];
-
-    for (let i = copy.length - 1; i > 0; i--) {
+function shuffle(deck) {
+    for (let i = deck.length - 1; i > 0; i--) {
         const j = Math.floor(Math.random() * (i + 1));
-        [copy[i], copy[j]] = [copy[j], copy[i]];
+
+        [deck[i], deck[j]] =
+            [deck[j], deck[i]];
     }
 
-    return copy;
+    return deck;
 }
 
-function generateRoomCode() {
-    const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+/* =========================================================
+   ROOM / GAME
+========================================================= */
 
-    let code;
+function createRoom(name) {
 
-    do {
-        code = "";
+    const roomCode = makeRoomCode();
+    const playerId = makeId();
 
-        for (let i = 0; i < 6; i++) {
-            code += chars[Math.floor(Math.random() * chars.length)];
-        }
-    } while (rooms.has(code));
+    const room = {
+        code: roomCode,
+        hostId: playerId,
 
-    return code;
-}
+        players: [
+            {
+                id: playerId,
+                name,
+                hand: [],
+                connected: true,
+                saidUno: false
+            }
+        ],
 
-function drawCards(room, amount) {
-    const cards = [];
+        deck: [],
+        discard: [],
+        currentColor: null,
 
-    for (let i = 0; i < amount; i++) {
-        if (room.deck.length === 0) {
-            rebuildDeck(room);
-        }
+        turnIndex: 0,
+        started: false,
 
-        if (room.deck.length === 0) break;
+        drawStack: 0,
 
-        cards.push(room.deck.pop());
-    }
+        winner: null
+    };
 
-    return cards;
-}
+    rooms.set(roomCode, room);
 
-function rebuildDeck(room) {
-    if (room.discard.length <= 1) {
-        return;
-    }
-
-    const top = room.discard.pop();
-
-    room.deck = shuffle(
-        room.discard.filter(card => card.value !== "wild" && card.value !== "draw4")
-    );
-
-    room.discard = [top];
-}
-
-function startGame(room) {
-    room.deck = createDeck();
-    room.discard = [];
-    room.started = true;
-    room.turn = 0;
-    room.direction = 1;
-    room.currentColor = null;
-
-    for (const player of room.players) {
-        player.hand = drawCards(room, 7);
-    }
-
-    let firstCard;
-
-    do {
-        firstCard = room.deck.pop();
-    } while (
-        firstCard &&
-        (firstCard.value === "wild" || firstCard.value === "draw4")
-    );
-
-    room.discard.push(firstCard);
-    room.currentColor = firstCard.color;
-
-    if (firstCard.value === "skip") {
-        room.turn = 1 % room.players.length;
-    } else if (firstCard.value === "reverse") {
-        room.direction = -1;
-
-        if (room.players.length === 2) {
-            room.turn = 1;
-        }
-    } else if (firstCard.value === "draw2") {
-        const next = 1 % room.players.length;
-        room.players[next].hand.push(...drawCards(room, 2));
-        room.turn = next;
-    }
-
-    emitRoomState(room);
-}
-
-function getPublicState(room, socketId) {
     return {
-        code: room.code,
-        started: room.started,
-        currentColor: room.currentColor,
-        discardTop: room.discard[room.discard.length - 1],
-        turnPlayerId: room.players[room.turn]?.id || null,
-        direction: room.direction,
-
-        players: room.players.map(player => ({
-            id: player.id,
-            name: player.name,
-            cardCount: player.hand.length
-        })),
-
-        yourHand: room.players.find(p => p.id === socketId)?.hand || []
+        room,
+        playerId
     };
 }
 
-function emitRoomState(room) {
-    for (const player of room.players) {
-        io.to(player.id).emit("game_state", getPublicState(room, player.id));
+function getRoom(code) {
+    return rooms.get(
+        String(code || "").toUpperCase()
+    );
+}
+
+function getPlayer(room, playerId) {
+    return room.players.find(
+        player => player.id === playerId
+    );
+}
+
+function currentPlayer(room) {
+    return room.players[room.turnIndex];
+}
+
+/* =========================================================
+   DRAWING / DISCARD
+========================================================= */
+
+function drawFromDeck(room) {
+
+    if (room.deck.length === 0) {
+
+        if (room.discard.length <= 1) {
+            return null;
+        }
+
+        const top =
+            room.discard.pop();
+
+        room.deck =
+            shuffle(room.discard);
+
+        room.discard = [top];
+    }
+
+    return room.deck.pop();
+}
+
+function drawCards(room, player, amount) {
+
+    const drawn = [];
+
+    for (let i = 0; i < amount; i++) {
+
+        const card =
+            drawFromDeck(room);
+
+        if (!card) break;
+
+        player.hand.push(card);
+        drawn.push(card);
+    }
+
+    return drawn;
+}
+
+/* =========================================================
+   TURN
+========================================================= */
+
+function nextTurn(room, amount = 1) {
+
+    const count =
+        room.players.length;
+
+    room.turnIndex =
+        (room.turnIndex + amount + count) % count;
+
+    const next =
+        currentPlayer(room);
+
+    if (next) {
+        next.saidUno = false;
     }
 }
 
-function getPlayer(room, socketId) {
-    return room.players.find(player => player.id === socketId);
-}
+/* =========================================================
+   PLAYABILITY
+========================================================= */
 
-function canPlay(card, room) {
-    const top = room.discard[room.discard.length - 1];
+function isPlayable(room, card) {
 
-    if (card.color === "wild") {
+    if (!room.discard.length) {
         return true;
     }
 
-    if (card.color === room.currentColor) {
+    const top =
+        room.discard[room.discard.length - 1];
+
+    // Stacking
+    if (room.drawStack > 0) {
+
+        if (top.type === "draw2") {
+            return card.type === "draw2";
+        }
+
+        if (top.type === "wild4") {
+            return card.type === "wild4";
+        }
+    }
+
+    // Wild
+    if (
+        card.type === "wild" ||
+        card.type === "wild4"
+    ) {
         return true;
     }
 
-    if (card.value === top.value) {
+    // Color
+    if (
+        card.color === room.currentColor
+    ) {
+        return true;
+    }
+
+    // Same action
+    if (
+        card.type === top.type &&
+        card.type !== "number"
+    ) {
+        return true;
+    }
+
+    // Same number
+    if (
+        card.type === "number" &&
+        top.type === "number" &&
+        card.value === top.value
+    ) {
         return true;
     }
 
     return false;
 }
 
-function nextTurn(room, amount = 1) {
-    const count = room.players.length;
+/* =========================================================
+   GAME START
+========================================================= */
 
-    room.turn =
-        (room.turn + room.direction * amount + count * 100) %
-        count;
+function startGame(room) {
+
+    room.deck =
+        shuffle(createDeck());
+
+    room.discard = [];
+    room.currentColor = null;
+    room.turnIndex = 0;
+    room.drawStack = 0;
+    room.winner = null;
+
+    for (const player of room.players) {
+
+        player.hand = [];
+        player.saidUno = false;
+
+        drawCards(room, player, 7);
+    }
+
+    // Find a non-wild starting card
+    let startingCard;
+
+    while (room.deck.length) {
+
+        const card =
+            room.deck.pop();
+
+        if (
+            card.type === "number" ||
+            card.type === "skip" ||
+            card.type === "reverse" ||
+            card.type === "draw2"
+        ) {
+            startingCard = card;
+            break;
+        }
+
+        room.deck.unshift(card);
+    }
+
+    if (!startingCard) {
+        startingCard = room.deck.pop();
+    }
+
+    room.discard.push(startingCard);
+
+    room.currentColor =
+        startingCard.color;
+
+    room.started = true;
 }
 
-function finishGame(room, winner) {
-    room.started = false;
+/* =========================================================
+   CARD LABELS
+========================================================= */
 
-    io.to(room.code).emit("game_over", {
-        winner: winner.name
-    });
+function cardText(card) {
+
+    switch (card.type) {
+
+        case "skip":
+            return "⊘";
+
+        case "reverse":
+            return "↻";
+
+        case "draw2":
+            return "+2";
+
+        case "wild":
+            return "WILD";
+
+        case "wild4":
+            return "+4";
+
+        default:
+            return card.value;
+    }
 }
 
-io.on("connection", socket => {
-    console.log("Player connected:", socket.id);
+function cardClass(card) {
 
-    socket.on("create_room", ({ name }) => {
-        name = String(name || "Player").trim().slice(0, 20);
+    if (card.type === "wild" ||
+        card.type === "wild4") {
+        return "wild";
+    }
 
-        const code = generateRoomCode();
+    return card.color;
+}
 
-        const room = {
-            code,
-            players: [],
-            deck: [],
-            discard: [],
-            started: false,
-            turn: 0,
-            direction: 1,
-            currentColor: null
-        };
+/* =========================================================
+   HTML
+========================================================= */
 
-        rooms.set(code, room);
+function page(title, content, refresh = false) {
 
-        room.players.push({
-            id: socket.id,
-            name,
-            hand: []
-        });
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
 
-        socket.join(code);
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 
-        socket.emit("room_created", {
-            code
-        });
+${refresh
+    ? `<meta http-equiv="refresh" content="3">`
+    : ""}
 
-        emitRoomState(room);
-    });
+<title>${escapeHtml(title)}</title>
 
-    socket.on("join_room", ({ code, name }) => {
-        code = String(code || "").trim().toUpperCase();
-        name = String(name || "Player").trim().slice(0, 20);
+<link rel="stylesheet" href="/style.css">
 
-        const room = rooms.get(code);
+</head>
 
-        if (!room) {
-            socket.emit("error_message", "Room not found.");
-            return;
-        }
+<body>
 
-        if (room.started) {
-            socket.emit("error_message", "That game has already started.");
-            return;
-        }
+<header class="topbar">
 
-        if (room.players.length >= 4) {
-            socket.emit("error_message", "That room is full.");
-            return;
-        }
+    <div class="brand">
+        <div class="brand-p">P</div>
 
-        if (
-            room.players.some(
-                player => player.name.toLowerCase() === name.toLowerCase()
-            )
-        ) {
-            socket.emit("error_message", "That name is already being used.");
-            return;
-        }
+        <div class="brand-name">
+            Pulse <span>UNO</span>
+        </div>
+    </div>
 
-        room.players.push({
-            id: socket.id,
-            name,
-            hand: []
-        });
+</header>
 
-        socket.join(code);
+<main>
+${content}
+</main>
 
-        socket.emit("room_joined", {
-            code
-        });
+</body>
+</html>`;
+}
 
-        emitRoomState(room);
-    });
-
-    socket.on("start_game", () => {
-        const room = [...rooms.values()].find(room =>
-            room.players.some(player => player.id === socket.id)
-        );
-
-        if (!room) return;
-
-        if (room.players[0]?.id !== socket.id) {
-            socket.emit("error_message", "Only the room host can start.");
-            return;
-        }
-
-        if (room.players.length < 2) {
-            socket.emit("error_message", "You need at least 2 players.");
-            return;
-        }
-
-        if (room.started) return;
-
-        startGame(room);
-    });
-
-    socket.on("play_card", ({ cardIndex, chosenColor }) => {
-        const room = [...rooms.values()].find(room =>
-            room.players.some(player => player.id === socket.id)
-        );
-
-        if (!room || !room.started) return;
-
-        const player = getPlayer(room, socket.id);
-
-        if (!player) return;
-
-        if (room.players[room.turn].id !== socket.id) {
-            socket.emit("error_message", "It isn't your turn.");
-            return;
-        }
-
-        if (
-            !Number.isInteger(cardIndex) ||
-            cardIndex < 0 ||
-            cardIndex >= player.hand.length
-        ) {
-            socket.emit("error_message", "Invalid card.");
-            return;
-        }
-
-        const card = player.hand[cardIndex];
-
-        if (!canPlay(card, room)) {
-            socket.emit("error_message", "You can't play that card.");
-            return;
-        }
-
-        if (
-            card.color === "wild" &&
-            !COLORS.includes(chosenColor)
-        ) {
-            socket.emit("error_message", "Choose a color.");
-            return;
-        }
-
-        player.hand.splice(cardIndex, 1);
-
-        room.discard.push(card);
-
-        if (card.color === "wild") {
-            room.currentColor = chosenColor;
-        } else {
-            room.currentColor = card.color;
-        }
-
-        if (player.hand.length === 0) {
-            emitRoomState(room);
-            finishGame(room, player);
-            return;
-        }
-
-        if (card.value === "skip") {
-            nextTurn(room, 2);
-        } else if (card.value === "reverse") {
-            room.direction *= -1;
-
-            if (room.players.length === 2) {
-                nextTurn(room, 2);
-            } else {
-                nextTurn(room, 1);
-            }
-        } else if (card.value === "draw2") {
-            nextTurn(room, 1);
-
-            const target = room.players[room.turn];
-            target.hand.push(...drawCards(room, 2));
-
-            nextTurn(room, 1);
-        } else if (card.value === "draw4") {
-            nextTurn(room, 1);
-
-            const target = room.players[room.turn];
-            target.hand.push(...drawCards(room, 4));
-
-            nextTurn(room, 1);
-        } else {
-            nextTurn(room, 1);
-        }
-
-        emitRoomState(room);
-    });
-
-    socket.on("draw_card", () => {
-        const room = [...rooms.values()].find(room =>
-            room.players.some(player => player.id === socket.id)
-        );
-
-        if (!room || !room.started) return;
-
-        const player = getPlayer(room, socket.id);
-
-        if (!player) return;
-
-        if (room.players[room.turn].id !== socket.id) {
-            socket.emit("error_message", "It isn't your turn.");
-            return;
-        }
-
-        const cards = drawCards(room, 1);
-
-        if (cards.length) {
-            player.hand.push(cards[0]);
-        }
-
-        nextTurn(room, 1);
-
-        emitRoomState(room);
-    });
-
-    socket.on("disconnect", () => {
-        console.log("Player disconnected:", socket.id);
-
-        for (const [code, room] of rooms.entries()) {
-            const index = room.players.findIndex(
-                player => player.id === socket.id
-            );
-
-            if (index === -1) continue;
-
-            room.players.splice(index, 1);
-
-            if (room.players.length === 0) {
-                rooms.delete(code);
-                continue;
-            }
-
-            if (room.started) {
-                room.started = false;
-
-                io.to(code).emit(
-                    "error_message",
-                    "A player disconnected. The game has ended."
-                );
-            }
-
-            room.turn = 0;
-
-            emitRoomState(room);
-        }
-    });
-});
+/* =========================================================
+   HOME
+========================================================= */
 
 app.get("/", (req, res) => {
+
+    const html = page(
+        "Pulse UNO",
+        `
+        <section class="center-page">
+
+            <div class="panel home-panel">
+
+                <div class="uno-logo">
+                    UNO
+                </div>
+
+                <h1>Pulse UNO</h1>
+
+                <p class="subtitle">
+                    Play UNO with your friends.
+                </p>
+
+                <form action="/create" method="POST">
+
+                    <label>
+                        YOUR NAME
+                    </label>
+
+                    <input
+                        name="name"
+                        maxlength="20"
+                        required
+                        autocomplete="nickname"
+                        placeholder="Enter your name"
+                    >
+
+                    <button class="button primary">
+                        CREATE ROOM
+                    </button>
+
+                </form>
+
+                <div class="or">
+                    OR
+                </div>
+
+                <form action="/join" method="POST">
+
+                    <label>
+                        ROOM CODE
+                    </label>
+
+                    <input
+                        name="room"
+                        maxlength="8"
+                        required
+                        autocomplete="off"
+                        placeholder="Enter room code"
+                    >
+
+                    <label>
+                        YOUR NAME
+                    </label>
+
+                    <input
+                        name="name"
+                        maxlength="20"
+                        required
+                        autocomplete="nickname"
+                        placeholder="Enter your name"
+                    >
+
+                    <button class="button secondary">
+                        JOIN ROOM
+                    </button>
+
+                </form>
+
+                <div class="pulse-suite">
+                    Pulse Suite
+                </div>
+
+            </div>
+
+        </section>
+        `
+    );
+
+    res.send(html);
+});
+
+/* =========================================================
+   CREATE
+========================================================= */
+
+app.post("/create", (req, res) => {
+
+    const name =
+        String(req.body.name || "")
+            .trim()
+            .slice(0, 20);
+
+    if (!name) {
+        return res.redirect("/");
+    }
+
+    const result =
+        createRoom(name);
+
+    redirect(
+        res,
+        result.room.code,
+        result.playerId
+    );
+});
+
+/* =========================================================
+   JOIN
+========================================================= */
+
+app.post("/join", (req, res) => {
+
+    const name =
+        String(req.body.name || "")
+            .trim()
+            .slice(0, 20);
+
+    const code =
+        String(req.body.room || "")
+            .trim()
+            .toUpperCase();
+
+    const room =
+        getRoom(code);
+
+    if (!room) {
+        return res.status(404).send(
+            page(
+                "Room Not Found",
+                `
+                <section class="center-page">
+                    <div class="panel message-panel">
+                        <h1>Room Not Found</h1>
+                        <p>
+                            That room doesn't exist.
+                        </p>
+                        <a class="button primary"
+                           href="/">
+                            Go Back
+                        </a>
+                    </div>
+                </section>
+                `
+            )
+        );
+    }
+
+    if (room.started) {
+        return res.status(400).send(
+            page(
+                "Game Started",
+                `
+                <section class="center-page">
+                    <div class="panel message-panel">
+                        <h1>Game Already Started</h1>
+                        <p>
+                            You can't join this room anymore.
+                        </p>
+                        <a class="button primary"
+                           href="/">
+                            Go Back
+                        </a>
+                    </div>
+                </section>
+                `
+            )
+        );
+    }
+
+    if (room.players.length >= 4) {
+        return res.status(400).send(
+            page(
+                "Room Full",
+                `
+                <section class="center-page">
+                    <div class="panel message-panel">
+                        <h1>Room Full</h1>
+                        <p>
+                            This room already has four players.
+                        </p>
+                        <a class="button primary"
+                           href="/">
+                            Go Back
+                        </a>
+                    </div>
+                </section>
+                `
+            )
+        );
+    }
+
+    const playerId =
+        makeId();
+
+    room.players.push({
+        id: playerId,
+        name: name || "Player",
+        hand: [],
+        connected: true,
+        saidUno: false
+    });
+
+    redirect(
+        res,
+        room.code,
+        playerId
+    );
+});
+
+/* =========================================================
+   GAME PAGE
+========================================================= */
+
+app.get("/game", (req, res) => {
+
+    const code =
+        String(req.query.room || "")
+            .toUpperCase();
+
+    const playerId =
+        String(req.query.player || "");
+
+    const room =
+        getRoom(code);
+
+    if (!room) {
+        return res.redirect("/");
+    }
+
+    const player =
+        getPlayer(room, playerId);
+
+    if (!player) {
+        return res.redirect("/");
+    }
+
+    player.connected = true;
+
+    if (!room.started) {
+        return renderLobby(
+            req,
+            res,
+            room,
+            player
+        );
+    }
+
+    return renderGame(
+        req,
+        res,
+        room,
+        player
+    );
+});
+
+/* =========================================================
+   LOBBY
+========================================================= */
+
+function renderLobby(
+    req,
+    res,
+    room,
+    player
+) {
+
+    const isHost =
+        room.hostId === player.id;
+
+    const players =
+        room.players
+            .map((p, index) => `
+                <div class="player-row">
+
+                    <div class="player-number">
+                        ${index + 1}
+                    </div>
+
+                    <div class="player-info">
+                        <strong>
+                            ${escapeHtml(p.name)}
+                        </strong>
+
+                        ${
+                            p.id === room.hostId
+                                ? `<span class="host">
+                                    HOST
+                                   </span>`
+                                : ""
+                        }
+                    </div>
+
+                </div>
+            `)
+            .join("");
+
+    const startButton =
+        isHost && room.players.length >= 2
+            ? `
+                <form action="/start" method="POST">
+
+                    <input
+                        type="hidden"
+                        name="room"
+                        value="${escapeHtml(room.code)}"
+                    >
+
+                    <input
+                        type="hidden"
+                        name="player"
+                        value="${escapeHtml(player.id)}"
+                    >
+
+                    <button class="button primary">
+                        START GAME
+                    </button>
+
+                </form>
+              `
+            : `
+                <div class="waiting">
+                    ${
+                        room.players.length < 2
+                            ? "Waiting for another player..."
+                            : "Waiting for the host..."
+                    }
+                </div>
+              `;
+
+    res.send(
+        page(
+            "Pulse UNO — Lobby",
+            `
+            <section class="center-page">
+
+                <div class="panel lobby-panel">
+
+                    <div class="eyebrow">
+                        PULSE UNO
+                    </div>
+
+                    <h1>Waiting Room</h1>
+
+                    <div class="room-code">
+                        ${escapeHtml(room.code)}
+                    </div>
+
+                    <p class="hint">
+                        Give this room code to your friend.
+                    </p>
+
+                    <div class="section-title">
+                        PLAYERS
+                    </div>
+
+                    <div class="player-list">
+                        ${players}
+                    </div>
+
+                    ${startButton}
+
+                </div>
+
+            </section>
+            `,
+            true
+        )
+    );
+}
+
+/* =========================================================
+   START
+========================================================= */
+
+app.post("/start", (req, res) => {
+
+    const room =
+        getRoom(req.body.room);
+
+    const player =
+        room &&
+        getPlayer(
+            room,
+            req.body.player
+        );
+
+    if (!room || !player) {
+        return res.redirect("/");
+    }
+
+    if (room.hostId !== player.id) {
+        return redirect(
+            res,
+            room.code,
+            player.id
+        );
+    }
+
+    if (room.players.length < 2) {
+        return redirect(
+            res,
+            room.code,
+            player.id
+        );
+    }
+
+    startGame(room);
+
+    redirect(
+        res,
+        room.code,
+        player.id
+    );
+});
+
+/* =========================================================
+   PLAY CARD
+========================================================= */
+
+app.post("/play", (req, res) => {
+
+    const room =
+        getRoom(req.body.room);
+
+    const player =
+        room &&
+        getPlayer(
+            room,
+            req.body.player
+        );
+
+    if (!room || !player || !room.started) {
+        return res.redirect("/");
+    }
+
+    const current =
+        currentPlayer(room);
+
+    if (!current || current.id !== player.id) {
+        return redirect(
+            res,
+            room.code,
+            player.id
+        );
+    }
+
+    const index =
+        Number.parseInt(
+            req.body.card,
+            10
+        );
+
+    if (
+        Number.isNaN(index) ||
+        index < 0 ||
+        index >= player.hand.length
+    ) {
+        return redirect(
+            res,
+            room.code,
+            player.id
+        );
+    }
+
+    const card =
+        player.hand[index];
+
+    if (!isPlayable(room, card)) {
+        return redirect(
+            res,
+            room.code,
+            player.id
+        );
+    }
+
+    // Wild +4 requires choosing a color
+    if (card.type === "wild4" ||
+        card.type === "wild") {
+
+        const chosenColor =
+            String(
+                req.body.color || ""
+            ).toLowerCase();
+
+        if (!COLORS.includes(chosenColor)) {
+
+            return renderWildChoice(
+                req,
+                res,
+                room,
+                player,
+                index
+            );
+        }
+
+        room.currentColor =
+            chosenColor;
+    } else {
+        room.currentColor =
+            card.color;
+    }
+
+    player.hand.splice(index, 1);
+
+    room.discard.push(card);
+
+    player.saidUno = false;
+
+    // Winner
+    if (player.hand.length === 0) {
+
+        room.winner =
+            player.id;
+
+        return redirect(
+            res,
+            room.code,
+            player.id
+        );
+    }
+
+    // Draw stacking
+    if (card.type === "draw2") {
+        room.drawStack += 2;
+    }
+
+    if (card.type === "wild4") {
+        room.drawStack += 4;
+    }
+
+    // Skip
+    if (card.type === "skip") {
+        nextTurn(room, 2);
+    }
+
+    // Reverse
+    else if (card.type === "reverse") {
+
+        room.players.reverse();
+
+        room.turnIndex =
+            room.players.findIndex(
+                p => p.id === player.id
+            );
+
+        nextTurn(room, 1);
+    }
+
+    // Draw cards
+    else if (
+        card.type === "draw2" ||
+        card.type === "wild4"
+    ) {
+        nextTurn(room, 1);
+    }
+
+    // Normal
+    else {
+        nextTurn(room, 1);
+    }
+
+    redirect(
+        res,
+        room.code,
+        player.id
+    );
+});
+
+/* =========================================================
+   WILD CHOICE
+========================================================= */
+
+function renderWildChoice(
+    req,
+    res,
+    room,
+    player,
+    cardIndex
+) {
+
+    res.send(
+        page(
+            "Choose a Color",
+            `
+            <section class="center-page">
+
+                <div class="panel wild-panel">
+
+                    <div class="uno-logo">
+                        UNO
+                    </div>
+
+                    <h1>Choose a Color</h1>
+
+                    <p class="subtitle">
+                        What color should play continue with?
+                    </p>
+
+                    <div class="wild-grid">
+
+                        ${COLORS.map(color => `
+                            <form action="/play"
+                                  method="POST">
+
+                                <input
+                                    type="hidden"
+                                    name="room"
+                                    value="${escapeHtml(room.code)}"
+                                >
+
+                                <input
+                                    type="hidden"
+                                    name="player"
+                                    value="${escapeHtml(player.id)}"
+                                >
+
+                                <input
+                                    type="hidden"
+                                    name="card"
+                                    value="${cardIndex}"
+                                >
+
+                                <input
+                                    type="hidden"
+                                    name="color"
+                                    value="${color}"
+                                >
+
+                                <button
+                                    class="wild-choice ${color}">
+                                    ${color.toUpperCase()}
+                                </button>
+
+                            </form>
+                        `).join("")}
+
+                    </div>
+
+                </div>
+
+            </section>
+            `
+        )
+    );
+}
+
+/* =========================================================
+   DRAW
+========================================================= */
+
+app.post("/draw", (req, res) => {
+
+    const room =
+        getRoom(req.body.room);
+
+    const player =
+        room &&
+        getPlayer(
+            room,
+            req.body.player
+        );
+
+    if (!room || !player || !room.started) {
+        return res.redirect("/");
+    }
+
+    const current =
+        currentPlayer(room);
+
+    if (!current || current.id !== player.id) {
+        return redirect(
+            res,
+            room.code,
+            player.id
+        );
+    }
+
+    let amount = 1;
+
+    if (room.drawStack > 0) {
+        amount = room.drawStack;
+        room.drawStack = 0;
+    }
+
+    drawCards(
+        room,
+        player,
+        amount
+    );
+
+    nextTurn(room, 1);
+
+    redirect(
+        res,
+        room.code,
+        player.id
+    );
+});
+
+/* =========================================================
+   UNO
+========================================================= */
+
+app.post("/uno", (req, res) => {
+
+    const room =
+        getRoom(req.body.room);
+
+    const player =
+        room &&
+        getPlayer(
+            room,
+            req.body.player
+        );
+
+    if (!room || !player) {
+        return res.redirect("/");
+    }
+
+    if (player.hand.length === 1) {
+        player.saidUno = true;
+    }
+
+    redirect(
+        res,
+        room.code,
+        player.id
+    );
+});
+
+/* =========================================================
+   NEW GAME
+========================================================= */
+
+app.post("/new-game", (req, res) => {
+
+    const room =
+        getRoom(req.body.room);
+
+    const player =
+        room &&
+        getPlayer(
+            room,
+            req.body.player
+        );
+
+    if (!room || !player) {
+        return res.redirect("/");
+    }
+
+    if (room.hostId !== player.id) {
+        return redirect(
+            res,
+            room.code,
+            player.id
+        );
+    }
+
+    startGame(room);
+
+    redirect(
+        res,
+        room.code,
+        player.id
+    );
+});
+
+/* =========================================================
+   GAME RENDER
+========================================================= */
+
+function renderGame(
+    req,
+    res,
+    room,
+    player
+) {
+
+    const winner =
+        room.winner
+            ? getPlayer(
+                room,
+                room.winner
+            )
+            : null;
+
+    if (winner) {
+
+        const newGame =
+            room.hostId === player.id
+                ? `
+                    <form action="/new-game"
+                          method="POST">
+
+                        <input
+                            type="hidden"
+                            name="room"
+                            value="${escapeHtml(room.code)}"
+                        >
+
+                        <input
+                            type="hidden"
+                            name="player"
+                            value="${escapeHtml(player.id)}"
+                        >
+
+                        <button class="button primary">
+                            PLAY AGAIN
+                        </button>
+
+                    </form>
+                  `
+                : `
+                    <div class="waiting">
+                        Waiting for the host...
+                    </div>
+                  `;
+
+        return res.send(
+            page(
+                "Game Over — Pulse UNO",
+                `
+                <section class="center-page">
+
+                    <div class="panel winner-panel">
+
+                        <div class="uno-logo">
+                            UNO
+                        </div>
+
+                        <div class="eyebrow">
+                            GAME OVER
+                        </div>
+
+                        <h1>
+                            ${escapeHtml(winner.name)}
+                            wins!
+                        </h1>
+
+                        ${newGame}
+
+                    </div>
+
+                </section>
+                `,
+                true
+            )
+        );
+    }
+
+    const current =
+        currentPlayer(room);
+
+    const myTurn =
+        current &&
+        current.id === player.id;
+
+    const topCard =
+        room.discard[
+            room.discard.length - 1
+        ];
+
+    const opponentHtml =
+        room.players
+            .filter(p => p.id !== player.id)
+            .map(p => `
+                <div class="opponent">
+
+                    <strong>
+                        ${escapeHtml(p.name)}
+                    </strong>
+
+                    <span>
+                        ${p.hand.length} cards
+                    </span>
+
+                    ${
+                        current &&
+                        current.id === p.id
+                            ? `<b>TURN</b>`
+                            : ""
+                    }
+
+                </div>
+            `)
+            .join("");
+
+    const handHtml =
+        player.hand
+            .map((card, index) => {
+
+                const playable =
+                    myTurn &&
+                    isPlayable(
+                        room,
+                        card
+                    );
+
+                return `
+                    <div class="hand-card-wrap">
+
+                        ${
+                            playable
+                                ? `
+                                <form
+                                    action="/play"
+                                    method="POST">
+
+                                    <input
+                                        type="hidden"
+                                        name="room"
+                                        value="${escapeHtml(room.code)}"
+                                    >
+
+                                    <input
+                                        type="hidden"
+                                        name="player"
+                                        value="${escapeHtml(player.id)}"
+                                    >
+
+                                    <input
+                                        type="hidden"
+                                        name="card"
+                                        value="${index}"
+                                    >
+
+                                    <button
+                                        class="uno-card ${cardClass(card)} playable"
+                                        title="Play this card">
+
+                                        <span>
+                                            ${escapeHtml(
+                                                cardText(card)
+                                            )}
+                                        </span>
+
+                                    </button>
+
+                                </form>
+                                `
+                                : `
+                                <div
+                                    class="uno-card ${cardClass(card)} disabled">
+
+                                    <span>
+                                        ${escapeHtml(
+                                            cardText(card)
+                                        )}
+                                    </span>
+
+                                </div>
+                                `
+                        }
+
+                    </div>
+                `;
+            })
+            .join("");
+
+    const drawButton =
+        myTurn
+            ? `
+                <form action="/draw"
+                      method="POST">
+
+                    <input
+                        type="hidden"
+                        name="room"
+                        value="${escapeHtml(room.code)}"
+                    >
+
+                    <input
+                        type="hidden"
+                        name="player"
+                        value="${escapeHtml(player.id)}"
+                    >
+
+                    <button class="button secondary">
+                        ${
+                            room.drawStack > 0
+                                ? `DRAW +${room.drawStack}`
+                                : "DRAW"
+                        }
+                    </button>
+
+                </form>
+              `
+            : "";
+
+    const unoButton =
+        player.hand.length === 1
+            ? `
+                <form action="/uno"
+                      method="POST">
+
+                    <input
+                        type="hidden"
+                        name="room"
+                        value="${escapeHtml(room.code)}"
+                    >
+
+                    <input
+                        type="hidden"
+                        name="player"
+                        value="${escapeHtml(player.id)}"
+                    >
+
+                    <button class="button danger">
+                        UNO!
+                    </button>
+
+                </form>
+              `
+            : "";
+
+    res.send(
+        page(
+            "Pulse UNO",
+            `
+            <section class="game-page">
+
+                <div class="game-header">
+
+                    <div>
+                        <div class="eyebrow">
+                            PULSE UNO
+                        </div>
+
+                        <div class="room-small">
+                            ROOM ${escapeHtml(room.code)}
+                        </div>
+                    </div>
+
+                    <div class="turn-status">
+                        ${
+                            myTurn
+                                ? "YOUR TURN"
+                                : `${escapeHtml(current.name)}'S TURN`
+                        }
+                    </div>
+
+                </div>
+
+                <div class="opponents">
+                    ${opponentHtml}
+                </div>
+
+                <div class="game-table">
+
+                    <div class="pile-area">
+
+                        <div class="pile-label">
+                            DISCARD
+                        </div>
+
+                        <div class="uno-card large ${cardClass(topCard)}">
+
+                            <span>
+                                ${escapeHtml(
+                                    cardText(topCard)
+                                )}
+                            </span>
+
+                        </div>
+
+                    </div>
+
+                    <div class="color-display">
+
+                        <div class="pile-label">
+                            COLOR
+                        </div>
+
+                        <div class="color-name ${room.currentColor}">
+                            ${escapeHtml(
+                                room.currentColor || "—"
+                            )}
+                        </div>
+
+                    </div>
+
+                </div>
+
+                <div class="game-controls">
+
+                    ${drawButton}
+                    ${unoButton}
+
+                </div>
+
+                <div class="hand-panel">
+
+                    <div class="hand-header">
+
+                        <span>
+                            YOUR HAND
+                        </span>
+
+                        <span>
+                            ${player.hand.length} cards
+                        </span>
+
+                    </div>
+
+                    <div class="player-hand">
+                        ${handHtml}
+                    </div>
+
+                </div>
+
+            </section>
+            `,
+            true
+        )
+    );
+}
+
+/* =========================================================
+   HEALTH
+========================================================= */
+
+app.get("/health", (req, res) => {
+
     res.json({
+        ok: true,
         service: "Pulse UNO",
-        status: "online"
+        status: "online",
+        rooms: rooms.size
     });
 });
 
-server.listen(PORT, () => {
-    console.log(`Pulse UNO server running on port ${PORT}`);
+/* =========================================================
+   SERVER
+========================================================= */
+
+app.listen(PORT, () => {
+
+    console.log(
+        `Pulse UNO running on port ${PORT}`
+    );
+
 });
